@@ -15,6 +15,10 @@
   </a>
 </p>
 
+<p align="center">
+  <img src="[images/screenshot.png](https://raw.githubusercontent.com/3astbeast/RedTail-Market-Structure/refs/heads/main/Screenshot%202026-03-03%20084922.png)" width="800" alt="RedTail Volume Profile Screenshot"/>
+</p>
+
 ---
 
 ## Overview
