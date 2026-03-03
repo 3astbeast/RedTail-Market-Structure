@@ -331,8 +331,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 ZoneInvalidation = "Wick"; ZoneCount = "Low";
                 OBDrawStyle = "Full Range";
                 BoxExtendBars = 15; DeleteBrokenBoxes = true;
+                ConvertToBreaker = true;
                 BullOBColor = System.Windows.Media.Brushes.SeaGreen; BullOBOpacity = 50;
                 BearOBColor = System.Windows.Media.Brushes.Crimson; BearOBOpacity = 50;
+                BullBreakerColor = System.Windows.Media.Brushes.Crimson; BullBreakerOpacity = 35;
+                BearBreakerColor = System.Windows.Media.Brushes.SeaGreen; BearBreakerOpacity = 35;
                 OBBorderOpacity = 100;
                 SwingLabelColor = System.Windows.Media.Brushes.Silver;
                 
@@ -1096,25 +1099,61 @@ Write-Host 'COPIED_MP3'
                     bool ib = (ob.OBType == "Bull");
                     int sa = CurrentBar - ob.StartBar;
                     if (sa < 0 || sa > CurrentBar) continue;
-                    int ea = (ob.Breaker && ob.BreakBar > 0) ? CurrentBar - ob.BreakBar : -BoxExtendBars;
-
-                    float xLeft, xRight;
-                    try
-                    {
-                        xLeft = cc.GetXByBarIndex(chartBars, CurrentBar - sa);
-                        xRight = ea < 0 ? cc.GetXByBarIndex(chartBars, CurrentBar - ea) : cc.GetXByBarIndex(chartBars, CurrentBar - ea);
-                    }
-                    catch { continue; }
-                    if (xRight < xLeft) { float t = xLeft; xLeft = xRight; xRight = t; }
 
                     float yTop = cs.GetYByValue(ob.Top);
                     float yBot = cs.GetYByValue(ob.Bottom);
 
-                    int op = ib ? BullOBOpacity : BearOBOpacity;
-                    var fillBrush = ib ? (ob.Breaker ? _bullBreakerFill : _bullFill) : (ob.Breaker ? _bearBreakerFill : _bearFill);
-                    var c4 = B2C4(fillBrush, op / 100f);
-                    using (var br = new SharpDX.Direct2D1.SolidColorBrush(rt, c4))
-                        rt.FillRectangle(new SharpDX.RectangleF(xLeft, yTop, xRight - xLeft, yBot - yTop), br);
+                    if (ob.Breaker && ConvertToBreaker && ob.BreakBar > 0)
+                    {
+                        // Split fill: OB portion (start -> break) + Breaker portion (break -> extend)
+                        float xLeft, xBreak, xRight;
+                        try
+                        {
+                            xLeft = cc.GetXByBarIndex(chartBars, ob.StartBar);
+                            xBreak = cc.GetXByBarIndex(chartBars, ob.BreakBar);
+                            xRight = cc.GetXByBarIndex(chartBars, CurrentBar + BoxExtendBars);
+                        }
+                        catch { continue; }
+
+                        // OB segment fill (original color)
+                        if (xBreak > xLeft)
+                        {
+                            int obOp = ib ? BullOBOpacity : BearOBOpacity;
+                            var obFill = ib ? _bullFill : _bearFill;
+                            var obC4 = B2C4(obFill, obOp / 100f);
+                            using (var br = new SharpDX.Direct2D1.SolidColorBrush(rt, obC4))
+                                rt.FillRectangle(new SharpDX.RectangleF(xLeft, yTop, xBreak - xLeft, yBot - yTop), br);
+                        }
+
+                        // Breaker segment fill (breaker color)
+                        if (xRight > xBreak)
+                        {
+                            int brkOp = ib ? BullBreakerOpacity : BearBreakerOpacity;
+                            var brkFill = ib ? _bullBreakerFill : _bearBreakerFill;
+                            var brkC4 = B2C4(brkFill, brkOp / 100f);
+                            using (var br = new SharpDX.Direct2D1.SolidColorBrush(rt, brkC4))
+                                rt.FillRectangle(new SharpDX.RectangleF(xBreak, yTop, xRight - xBreak, yBot - yTop), br);
+                        }
+                    }
+                    else
+                    {
+                        // Standard single fill
+                        int ea = (ob.Breaker && ob.BreakBar > 0) ? CurrentBar - ob.BreakBar : -BoxExtendBars;
+                        float xLeft, xRight;
+                        try
+                        {
+                            xLeft = cc.GetXByBarIndex(chartBars, CurrentBar - sa);
+                            xRight = ea < 0 ? cc.GetXByBarIndex(chartBars, CurrentBar - ea) : cc.GetXByBarIndex(chartBars, CurrentBar - ea);
+                        }
+                        catch { continue; }
+                        if (xRight < xLeft) { float t = xLeft; xLeft = xRight; xRight = t; }
+
+                        int op = ib ? BullOBOpacity : BearOBOpacity;
+                        var fillBrush = ib ? (ob.Breaker ? _bullBreakerFill : _bullFill) : (ob.Breaker ? _bearBreakerFill : _bearFill);
+                        var c4 = B2C4(fillBrush, op / 100f);
+                        using (var br = new SharpDX.Direct2D1.SolidColorBrush(rt, c4))
+                            rt.FillRectangle(new SharpDX.RectangleF(xLeft, yTop, xRight - xLeft, yBot - yTop), br);
+                    }
                 }
             }
         }
@@ -2175,9 +2214,26 @@ Write-Host 'COPIED_MP3'
                 var ob = _bullOBList[i];
                 if (!ob.Breaker)
                 {
-                    if ((w ? Low[0] : Math.Min(Open[0], Close[0])) < ob.Bottom) { ob.Breaker = true; ob.BreakBar = CurrentBar; }
+                    if ((w ? Low[0] : Math.Min(Open[0], Close[0])) < ob.Bottom)
+                    {
+                        if (ConvertToBreaker)
+                        {
+                            ob.Breaker = true;
+                            ob.BreakBar = CurrentBar;
+                        }
+                        else
+                        {
+                            ob.Breaker = true; ob.BreakBar = CurrentBar;
+                            if (DeleteBrokenBoxes) { RmOB(ob); _bullOBList.RemoveAt(i); }
+                        }
+                    }
                 }
-                else if (High[0] > ob.Top && DeleteBrokenBoxes) { RmOB(ob); _bullOBList.RemoveAt(i); }
+                else
+                {
+                    // Breaker block: broken bull OB acts as bearish resistance
+                    double inv = w ? High[0] : Math.Max(Open[0], Close[0]);
+                    if (inv > ob.Top) { RmOB(ob); _bullOBList.RemoveAt(i); }
+                }
             }
 
             // Detect new bull OB
@@ -2224,9 +2280,26 @@ Write-Host 'COPIED_MP3'
                 var ob = _bearOBList[i];
                 if (!ob.Breaker)
                 {
-                    if ((w ? High[0] : Math.Max(Open[0], Close[0])) > ob.Top) { ob.Breaker = true; ob.BreakBar = CurrentBar; }
+                    if ((w ? High[0] : Math.Max(Open[0], Close[0])) > ob.Top)
+                    {
+                        if (ConvertToBreaker)
+                        {
+                            ob.Breaker = true;
+                            ob.BreakBar = CurrentBar;
+                        }
+                        else
+                        {
+                            ob.Breaker = true; ob.BreakBar = CurrentBar;
+                            if (DeleteBrokenBoxes) { RmOB(ob); _bearOBList.RemoveAt(i); }
+                        }
+                    }
                 }
-                else if (Low[0] < ob.Bottom && DeleteBrokenBoxes) { RmOB(ob); _bearOBList.RemoveAt(i); }
+                else
+                {
+                    // Breaker block: broken bear OB acts as bullish support
+                    double inv = w ? Low[0] : Math.Min(Open[0], Close[0]);
+                    if (inv < ob.Bottom) { RmOB(ob); _bearOBList.RemoveAt(i); }
+                }
             }
 
             // Detect new bear OB
@@ -2280,16 +2353,40 @@ Write-Host 'COPIED_MP3'
             if (ob.Tag == null) return;
             bool ib = (ob.OBType == "Bull"); int sa = CurrentBar - ob.StartBar;
             if (sa < 0 || sa > CurrentBar) return;
-            int ea = (ob.Breaker && ob.BreakBar > 0) ? CurrentBar - ob.BreakBar : -BoxExtendBars;
             double mp = (ob.Top + ob.Bottom) / 2.0;
-            System.Windows.Media.Brush b = MB(ib ? BullOBColor : BearOBColor, OBBorderOpacity);
-            DashStyleHelper ds = ob.Breaker ? DashStyleHelper.Dash : DashStyleHelper.Solid;
-            Draw.Line(this, ob.Tag + "_LT", false, sa, ob.Top, ea, ob.Top, b, ds, 1);
-            Draw.Line(this, ob.Tag + "_LB", false, sa, ob.Bottom, ea, ob.Bottom, b, ds, 1);
-            Draw.Line(this, ob.Tag + "_LM", false, sa, mp, ea, mp, b, DashStyleHelper.Dot, 1);
+
+            if (ob.Breaker && ConvertToBreaker && ob.BreakBar > 0)
+            {
+                // Split rendering: OB segment (start -> break) + Breaker segment (break -> extend)
+                int breakBarsAgo = CurrentBar - ob.BreakBar;
+
+                // Segment 1: Original OB color from start to break point
+                var obBrush = MB(ib ? BullOBColor : BearOBColor, OBBorderOpacity);
+                Draw.Line(this, ob.Tag + "_LT", false, sa, ob.Top, breakBarsAgo, ob.Top, obBrush, DashStyleHelper.Solid, 1);
+                Draw.Line(this, ob.Tag + "_LB", false, sa, ob.Bottom, breakBarsAgo, ob.Bottom, obBrush, DashStyleHelper.Solid, 1);
+                Draw.Line(this, ob.Tag + "_LM", false, sa, mp, breakBarsAgo, mp, obBrush, DashStyleHelper.Dot, 1);
+
+                // Segment 2: Breaker color from break point forward
+                var brkBrush = MB(ib ? BullBreakerColor : BearBreakerColor, OBBorderOpacity);
+                Draw.Line(this, ob.Tag + "_BT", false, breakBarsAgo, ob.Top, -BoxExtendBars, ob.Top, brkBrush, DashStyleHelper.Dash, 1);
+                Draw.Line(this, ob.Tag + "_BB", false, breakBarsAgo, ob.Bottom, -BoxExtendBars, ob.Bottom, brkBrush, DashStyleHelper.Dash, 1);
+                Draw.Line(this, ob.Tag + "_BM", false, breakBarsAgo, mp, -BoxExtendBars, mp, brkBrush, DashStyleHelper.Dot, 1);
+            }
+            else
+            {
+                // Standard single-segment rendering
+                int ea = (ob.Breaker && ob.BreakBar > 0) ? CurrentBar - ob.BreakBar : -BoxExtendBars;
+                var b = MB(ib ? BullOBColor : BearOBColor, OBBorderOpacity);
+                DashStyleHelper ds = ob.Breaker ? DashStyleHelper.Dash : DashStyleHelper.Solid;
+                Draw.Line(this, ob.Tag + "_LT", false, sa, ob.Top, ea, ob.Top, b, ds, 1);
+                Draw.Line(this, ob.Tag + "_LB", false, sa, ob.Bottom, ea, ob.Bottom, b, ds, 1);
+                Draw.Line(this, ob.Tag + "_LM", false, sa, mp, ea, mp, b, DashStyleHelper.Dot, 1);
+                // Clean up breaker segments if they existed before
+                foreach (var s in new[] { "_BT", "_BB", "_BM" }) RemoveDrawObject(ob.Tag + s);
+            }
         }
 
-        private void RmOB(OBInfo ob) { if (ob.Tag == null) return; foreach (var s in new[] { "_LT", "_LB", "_LM" }) RemoveDrawObject(ob.Tag + s); }
+        private void RmOB(OBInfo ob) { if (ob.Tag == null) return; foreach (var s in new[] { "_LT", "_LB", "_LM", "_BT", "_BB", "_BM" }) RemoveDrawObject(ob.Tag + s); }
         private int GetMaxOB() { switch (ZoneCount) { case "One": return 1; case "Low": return 3; case "Medium": return 5; case "High": return 10; default: return 3; } }
 
         #endregion
@@ -2651,7 +2748,7 @@ Write-Host 'COPIED_MP3'
         private void CacheBrushes()
         {
             _bullFill = MB(BullOBColor, BullOBOpacity); _bearFill = MB(BearOBColor, BearOBOpacity);
-            _bullBreakerFill = MB(BullOBColor, Math.Max(BullOBOpacity / 2, 5)); _bearBreakerFill = MB(BearOBColor, Math.Max(BearOBOpacity / 2, 5));
+            _bullBreakerFill = MB(BullBreakerColor, BullBreakerOpacity); _bearBreakerFill = MB(BearBreakerColor, BearBreakerOpacity);
             _cachedBOSBrush = MB(BOSColor, BOSOpacity);
             _cachedRetraceBrush = MB(HalfRetracementColor, HalfRetracementOpacity);
             _cachedStrongHighBrush = MB(StrongHighColor, StrongLevelOpacity);
@@ -2940,6 +3037,25 @@ Write-Host 'COPIED_MP3'
 
         [Display(Name = "Border Opacity %", Order = 13, GroupName = "04. Order Blocks")][Range(10, 100)]
         public int OBBorderOpacity { get; set; }
+
+        [Display(Name = "Convert to Breaker Block", Description = "When an OB is broken, convert it to a breaker block that persists with changed color instead of being removed.", Order = 14, GroupName = "04. Order Blocks")]
+        public bool ConvertToBreaker { get; set; }
+
+        [XmlIgnore]
+        [Display(Name = "Bull Breaker Color", Description = "Color for broken bullish OBs (now bearish resistance breakers).", Order = 15, GroupName = "04. Order Blocks")]
+        public System.Windows.Media.Brush BullBreakerColor { get; set; }
+        [Browsable(false)] public string BullBreakerColorS { get { return Serialize.BrushToString(BullBreakerColor); } set { BullBreakerColor = Serialize.StringToBrush(value); } }
+
+        [Display(Name = "Bull Breaker Opacity %", Order = 16, GroupName = "04. Order Blocks")][Range(0, 100)]
+        public int BullBreakerOpacity { get; set; }
+
+        [XmlIgnore]
+        [Display(Name = "Bear Breaker Color", Description = "Color for broken bearish OBs (now bullish support breakers).", Order = 17, GroupName = "04. Order Blocks")]
+        public System.Windows.Media.Brush BearBreakerColor { get; set; }
+        [Browsable(false)] public string BearBreakerColorS { get { return Serialize.BrushToString(BearBreakerColor); } set { BearBreakerColor = Serialize.StringToBrush(value); } }
+
+        [Display(Name = "Bear Breaker Opacity %", Order = 18, GroupName = "04. Order Blocks")][Range(0, 100)]
+        public int BearBreakerOpacity { get; set; }
 
         // ══════════════════════════════════════════════════════════════
         // 5. FRVP — VOLUME PROFILE
