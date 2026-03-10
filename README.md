@@ -33,6 +33,7 @@ This indicator uses Windows Voice for alerts instead of Ninja Trader's built in 
 6. At the top of the Editor window, click the "Compile" button
 7. If you get an error on compilation, do the following: Open Ninja Compiler, right click and choose references. Click add. Browse to this: C:\Windows\Microsoft.NET\assembly\GAC_MSIL\System.Speech\v4.0_4.0.0.0__31bf3856ad364e35\System.Speech.dll
 8. After that .dll is referenced, the indicator will compile successfully.
+   
 ---
 
 ## Overview
