@@ -21,6 +21,20 @@
 
 ---
 
+**IMPORTANT INSTALLATION INSTRUCTIONS**
+
+This indicator uses Windows Voice for alerts instead of Ninja Trader's built in beeps, honks and blips. If you install this .cs file and get an error on compilation, your NT install is missing a required .dll.  See step #7 below:
+
+1. Download the .cs file from the indicator's repository
+2. Copy the .cs to documents\Ninja Trader 8\bin\custom\indicators
+3. Open Ninja Trader (if not already open) 
+4. In control center, go to New --> Ninja Script Editor
+5. Expand the Indicator Tree, find your new indicator, double click to open it
+6. At the top of the Editor window, click the "Compile" button
+7. If you get an error on compilation, do the following: Open Ninja Compiler, right click and choose references. Click add. Browse to this: C:\Windows\Microsoft.NET\assembly\GAC_MSIL\System.Speech\v4.0_4.0.0.0__31bf3856ad364e35\System.Speech.dll
+8. After that .dll is referenced, the indicator will compile successfully.
+---
+
 ## Overview
 
 RedTail Market Structure is a comprehensive market structure indicator that identifies Breaks of Structure (BOS), Changes of Character (CHoCH), order blocks, strong/weak swing levels, displacement candles, equal highs/lows, and liquidity sweeps. It also integrates a full Fixed Range Volume Profile (FRVP) engine with Fibonacci retracements, Anchored VWAP, and K-Means cluster detection — all triggered automatically from structure events.
