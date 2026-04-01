@@ -1,5 +1,6 @@
 #region Using declarations
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
@@ -111,6 +112,32 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
         Adaptive
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // Transfer structs — used by RedTailMarketStructureCompanion to receive
+    // snapshots of live data without coupling to internal private classes.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// <summary>Plain-old-data snapshot of one strong level.</summary>
+    public class MSStrongLevelInfo
+    {
+        public double Price;
+        public bool   IsHigh;     // true = resistance (swing high), false = support (swing low)
+        public bool   Mitigated;  // level has been touched / faded
+        public int    BarIndex;   // absolute bar index on the source chart where this level was formed
+    }
+
+    /// <summary>Plain-old-data snapshot of one order block or breaker block zone.</summary>
+    public class MSOBZoneInfo
+    {
+        public double Top;
+        public double Bottom;
+        public bool   IsBull;     // true = bull OB / bear breaker (green side)
+        public bool   IsBreaker;  // true = this OB has flipped into a breaker
+        public bool   Disabled;   // broken / invalidated (shown only when ShowHistoricZones = true)
+        public int    StartBar;   // absolute bar index where the OB was formed on the source chart
+        public int    BreakBar;   // absolute bar index where it became a breaker (0 if still active OB)
+    }
+
     public class RedTailMarketStructureV2 : Indicator
     {
         #region Private Classes
@@ -143,6 +170,9 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
             public List<ClusterLevelInfo> ClusterLevels;
             public List<bool> VolumePolarities;
             public bool Dirty;
+            public int LastProcessedBarIdx;  // for incremental FRVP calculation
+            public double[] IncrBullVol;     // running bullish volume per row
+            public double[] IncrBearVol;     // running bearish volume per row
         }
 
         private struct ClusterLevelInfo
@@ -156,6 +186,39 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
         }
 
         private struct FibLevel { public double Ratio; public System.Windows.Media.Brush Color; }
+
+        // ── SharpDX-only render data (replaces Draw.* objects) ──
+
+        private struct BOSRenderInfo
+        {
+            public int StartBar;   // absolute bar index of the swing point
+            public int EndBar;     // absolute bar index of the break bar (CurrentBar at detection)
+            public double Price;
+            public bool IsCHoCH;
+            public bool IsBull;    // direction of the break
+        }
+
+        private struct SwingLabelInfo
+        {
+            public int BarIndex;   // absolute bar index
+            public double Price;
+            public string Label;
+            public bool IsHigh;
+        }
+
+        private struct HalfRetraceInfo
+        {
+            public int StartBar;   // absolute bar index
+            public int EndBar;     // absolute bar index
+            public double Price;
+        }
+
+        private struct DisplacementInfo
+        {
+            public int BarIndex;
+            public double Price;
+            public bool IsBull;
+        }
 
         private class StrongLevel
         {
@@ -238,6 +301,131 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
         // OB touch tracking (to avoid repeated alerts for same OB)
         private HashSet<string> _obTouchAlerted;
 
+        // SharpDX-only render data lists (replaces Draw.* objects for speed)
+        private List<BOSRenderInfo> _bosRenders;
+        private List<SwingLabelInfo> _swingLabelRenders;
+        private List<HalfRetraceInfo> _halfRetraceRenders;
+        private List<DisplacementInfo> _displacementRenders;
+
+        #endregion
+
+        #region Cross-chart registry (used by RedTailMarketStructureCompanion)
+
+        /// <summary>
+        /// Global registry: key → running instance of RedTailMarketStructureV2.
+        /// Allows the Companion indicator on any chart to locate this instance
+        /// without requiring a data-series link.
+        /// Key format: "INSTRUMENT|PERIODTYPE|PERIODVALUE"  e.g. "MNQ|Minute|5"
+        /// </summary>
+        public static readonly ConcurrentDictionary<string, RedTailMarketStructureV2>
+            Registry = new ConcurrentDictionary<string, RedTailMarketStructureV2>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Build the registry lookup key from an instrument + bar period.</summary>
+        public static string BuildRegistryKey(Instrument instrument, BarsPeriod period)
+        {
+            if (instrument == null || period == null) return string.Empty;
+            return instrument.MasterInstrument.Name
+                   + "|" + period.BarsPeriodType
+                   + "|" + period.Value;
+        }
+
+        /// <summary>Expose the instrument name so the Companion can display it in its status label.</summary>
+        public string InstrumentName => instrumentName;
+
+        /// <summary>Expose current bar count so the Companion can compute OB right-edge pixel positions.</summary>
+        public int SourceCurrentBar => CurrentBar;
+
+        /// <summary>Expose BoxExtendBars so the Companion renders OBs with the same extension as the source.</summary>
+        public int SourceBoxExtendBars => BoxExtendBars;
+
+        /// <summary>
+        /// Register this instance in the shared registry. Safe to call multiple times —
+        /// uses Bars.BarsPeriod which is guaranteed valid from State.Historical onward.
+        /// </summary>
+        private void TryRegister()
+        {
+            try
+            {
+                if (Instrument == null || Bars == null || Bars.BarsPeriod == null) return;
+                string regKey = BuildRegistryKey(Instrument, Bars.BarsPeriod);
+                if (string.IsNullOrEmpty(regKey)) return;
+                Registry[regKey] = this;
+                Print("RedTail MS: Registered in companion registry as '" + regKey + "'");
+            }
+            catch (Exception ex)
+            {
+                Print("RedTail MS: Registry error: " + ex.Message);
+            }
+        }
+
+        #endregion
+
+        #region Public data accessors for RedTailMarketStructureCompanion
+
+        /// <summary>
+        /// Returns a snapshot of all current strong levels.
+        /// Called each bar by the Companion to refresh its cached copy.
+        /// Thread-safe: returns a new list so the Companion can iterate freely.
+        /// </summary>
+        public List<MSStrongLevelInfo> GetStrongLevels()
+        {
+            var result = new List<MSStrongLevelInfo>();
+            if (_strongLevels == null) return result;
+            foreach (var sl in _strongLevels)
+            {
+                result.Add(new MSStrongLevelInfo
+                {
+                    Price     = sl.Price,
+                    IsHigh    = sl.IsHigh,
+                    Mitigated = sl.Mitigated,
+                    BarIndex  = sl.BarIndex
+                });
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Returns a snapshot of all current order block and breaker block zones.
+        /// Called each bar by the Companion to refresh its cached copy.
+        /// </summary>
+        public List<MSOBZoneInfo> GetOBZones()
+        {
+            var result = new List<MSOBZoneInfo>();
+            if (_bullOBList != null)
+            {
+                foreach (var ob in _bullOBList)
+                {
+                    result.Add(new MSOBZoneInfo
+                    {
+                        Top       = ob.Top,
+                        Bottom    = ob.Bottom,
+                        IsBull    = true,
+                        IsBreaker = ob.Breaker,
+                        Disabled  = ob.Disabled,
+                        StartBar  = ob.StartBar,
+                        BreakBar  = ob.BreakBar
+                    });
+                }
+            }
+            if (_bearOBList != null)
+            {
+                foreach (var ob in _bearOBList)
+                {
+                    result.Add(new MSOBZoneInfo
+                    {
+                        Top       = ob.Top,
+                        Bottom    = ob.Bottom,
+                        IsBull    = false,
+                        IsBreaker = ob.Breaker,
+                        Disabled  = ob.Disabled,
+                        StartBar  = ob.StartBar,
+                        BreakBar  = ob.BreakBar
+                    });
+                }
+            }
+            return result;
+        }
+
         #endregion
 
         protected override void OnStateChange()
@@ -246,7 +434,7 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
             {
                 Description = "RedTail Market Structure - BOS/CHoCH, Volumized OBs, Integrated FRVP Fib";
                 Name = "RedTail Market Structure";
-                Calculate = Calculate.OnBarClose;
+                Calculate = Calculate.OnPriceChange;
                 IsOverlay = true;
                 DisplayInDataBox = false;
                 DrawOnPricePanel = true;
@@ -414,6 +602,12 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
                 lastTouchState = new Dictionary<string, bool>();
                 _obTouchAlerted = new HashSet<string>();
 
+                // Initialize SharpDX render data lists
+                _bosRenders = new List<BOSRenderInfo>();
+                _swingLabelRenders = new List<SwingLabelInfo>();
+                _halfRetraceRenders = new List<HalfRetraceInfo>();
+                _displacementRenders = new List<DisplacementInfo>();
+
                 if (EnableVoiceAlerts)
                 {
                     try
@@ -433,6 +627,33 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
 
                 // Also clear historic FRVPs on reload to prevent stale references
                 if (_historicFrvps != null) _historicFrvps.Clear();
+
+                // Attempt registration now — Bars may already be valid at DataLoaded
+                TryRegister();
+            }
+            else if (State == State.Historical)
+            {
+                // Re-register at Historical — Bars.BarsPeriod is guaranteed valid here
+                TryRegister();
+            }
+            else if (State == State.Realtime)
+            {
+                // Re-register at Realtime as a final safety net
+                TryRegister();
+            }
+            else if (State == State.Terminated)
+            {
+                // Deregister so the Companion never holds a stale reference
+                if (Instrument != null)
+                {
+                    BarsPeriod bp = (Bars != null) ? Bars.BarsPeriod : new BarsPeriod();
+                    string regKey = BuildRegistryKey(Instrument, bp);
+                    if (!string.IsNullOrEmpty(regKey))
+                    {
+                        RedTailMarketStructureV2 removed;
+                        Registry.TryRemove(regKey, out removed);
+                    }
+                }
             }
         }
 
@@ -443,10 +664,6 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
 
             // All heavy structure/rendering logic is bar-close only
             if (!IsFirstTickOfBar) return;
-
-            // Bar-close alert check as fallback (real-time touch alerts are handled by OnMarketData)
-            if (State == State.Realtime)
-                CheckLevelAlerts(Close[0]);
 
             if (!_brushesCached) CacheBrushes();
             ProcessMarketStructure();
@@ -468,22 +685,19 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
         protected override void OnMarketData(MarketDataEventArgs e)
         {
             if (e.MarketDataType != MarketDataType.Last) return;
-            CheckLevelAlerts(e.Price);
+            CheckLevelAlerts();
         }
 
         #region Level Touch Alerts
 
-        private void CheckLevelAlerts(double livePrice)
+        private void CheckLevelAlerts()
         {
             if (State != State.Realtime) return;
             if (!AlertOnOBTouch && !AlertOnAVWAPTouch && !AlertOnFibTouch) return;
 
-            // Use live price for touch detection - works regardless of Calculate mode
-            // For range checks (OB zones), use the current bar's developing high/low
-            // combined with the live tick price for maximum responsiveness
-            double highPrice = Math.Max(High[0], livePrice);
-            double lowPrice  = Math.Min(Low[0], livePrice);
-            double closePrice = livePrice;
+            double closePrice = Close[0];
+            double highPrice = High[0];
+            double lowPrice = Low[0];
 
             // ── OB Touch Alerts ──
             if (AlertOnOBTouch)
@@ -1076,8 +1290,9 @@ Write-Host 'COPIED_MP3'
             if (chartControl.BarsArray == null || chartControl.BarsArray.Count == 0) return;
             var chartBars = chartControl.BarsArray[0];
 
-            // Render OB zone fills via SharpDX (no click capture)
+            // Render OB zone fills + borders via SharpDX (no click capture)
             RenderOBFills(rt, chartControl, chartScale, chartBars);
+            RenderOBBorders(rt, chartControl, chartScale, chartBars);
 
             // Render sweep rectangles via SharpDX (no click capture)
             RenderSweepRects(rt, chartControl, chartScale, chartBars);
@@ -1087,6 +1302,18 @@ Write-Host 'COPIED_MP3'
 
             // Render equal levels via SharpDX
             RenderEqualLevels(rt, chartControl, chartScale, chartBars);
+
+            // Render BOS/CHoCH lines + labels via SharpDX
+            RenderBOSLines(rt, chartControl, chartScale, chartBars);
+
+            // Render swing labels via SharpDX
+            RenderSwingLabels(rt, chartControl, chartScale, chartBars);
+
+            // Render half-retracement lines via SharpDX
+            RenderHalfRetrace(rt, chartControl, chartScale, chartBars);
+
+            // Render displacement markers via SharpDX
+            RenderDisplacement(rt, chartControl, chartScale, chartBars);
 
             // Render Trend Display
             if (ShowTrendDisplay)
@@ -1100,6 +1327,242 @@ Write-Host 'COPIED_MP3'
 
                 if (_activeFrvp != null && _activeFrvp.IsActive)
                     RenderFRVPZone(_activeFrvp, rt, chartControl, chartScale, cp, chartBars);
+            }
+        }
+
+        private void RenderBOSLines(SharpDX.Direct2D1.RenderTarget rt, ChartControl cc, ChartScale cs, ChartBars chartBars)
+        {
+            if (_bosRenders == null || _bosRenders.Count == 0) return;
+
+            var bosC4 = B2C4(BOSColor, BOSOpacity / 100f);
+            var bosStroke = MakeSS(rt, GetDS(BOSStyle));
+
+            using (var lineBr = new SharpDX.Direct2D1.SolidColorBrush(rt, bosC4))
+            using (var fmt = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Arial",
+                SharpDX.DirectWrite.FontWeight.Bold, SharpDX.DirectWrite.FontStyle.Normal, BOSLabelFontSize))
+            {
+                // Only render BOS lines whose start or end bar is within the visible range
+                int firstVisBar = chartBars.FromIndex;
+                int lastVisBar = chartBars.ToIndex;
+
+                for (int i = 0; i < _bosRenders.Count; i++)
+                {
+                    var bos = _bosRenders[i];
+                    // Skip if entirely off-screen
+                    if (bos.StartBar > lastVisBar && bos.EndBar > lastVisBar) continue;
+                    if (bos.StartBar < firstVisBar && bos.EndBar < firstVisBar) continue;
+
+                    float xLeft, xRight;
+                    try
+                    {
+                        xLeft = cc.GetXByBarIndex(chartBars, bos.StartBar);
+                        xRight = cc.GetXByBarIndex(chartBars, bos.EndBar);
+                    }
+                    catch { continue; }
+
+                    float y = cs.GetYByValue(bos.Price);
+                    rt.DrawLine(new SharpDX.Vector2(xLeft, y), new SharpDX.Vector2(xRight, y), lineBr, BOSWidth, bosStroke);
+
+                    // Label at midpoint
+                    try
+                    {
+                        string label = bos.IsCHoCH ? "CHoCH" : "BOS";
+                        float mx = (xLeft + xRight) / 2f;
+                        float ly = bos.IsBull ? y - BOSLabelFontSize - 4 : y + 2;
+                        using (var tl = new SharpDX.DirectWrite.TextLayout(NinjaTrader.Core.Globals.DirectWriteFactory, label, fmt, 100, 20))
+                        {
+                            float lx = mx - tl.Metrics.Width / 2;
+                            rt.DrawTextLayout(new SharpDX.Vector2(lx, ly), tl, lineBr);
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        private void RenderSwingLabels(SharpDX.Direct2D1.RenderTarget rt, ChartControl cc, ChartScale cs, ChartBars chartBars)
+        {
+            if (!ShowSwingLabels || _swingLabelRenders == null || _swingLabelRenders.Count == 0) return;
+
+            var labelC4 = B2C4(SwingLabelColor, 1.0f);
+            int firstVisBar = chartBars.FromIndex;
+            int lastVisBar = chartBars.ToIndex;
+
+            using (var br = new SharpDX.Direct2D1.SolidColorBrush(rt, labelC4))
+            using (var fmt = new SharpDX.DirectWrite.TextFormat(NinjaTrader.Core.Globals.DirectWriteFactory, "Arial",
+                SharpDX.DirectWrite.FontWeight.Normal, SharpDX.DirectWrite.FontStyle.Normal, SwingLabelFontSize))
+            {
+                for (int i = 0; i < _swingLabelRenders.Count; i++)
+                {
+                    var sl = _swingLabelRenders[i];
+                    if (sl.BarIndex < firstVisBar || sl.BarIndex > lastVisBar) continue;
+
+                    float x;
+                    try { x = cc.GetXByBarIndex(chartBars, sl.BarIndex); } catch { continue; }
+                    float y = cs.GetYByValue(sl.Price);
+
+                    try
+                    {
+                        using (var tl = new SharpDX.DirectWrite.TextLayout(NinjaTrader.Core.Globals.DirectWriteFactory, sl.Label, fmt, 100, 20))
+                        {
+                            float lx = x - tl.Metrics.Width / 2;
+                            float ly = sl.IsHigh ? y - tl.Metrics.Height : y;
+                            rt.DrawTextLayout(new SharpDX.Vector2(lx, ly), tl, br);
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        private void RenderHalfRetrace(SharpDX.Direct2D1.RenderTarget rt, ChartControl cc, ChartScale cs, ChartBars chartBars)
+        {
+            if (!ShowHalfRetracement || _halfRetraceRenders == null || _halfRetraceRenders.Count == 0) return;
+
+            var hrC4 = B2C4(HalfRetracementColor, HalfRetracementOpacity / 100f);
+            var hrStroke = MakeSS(rt, GetDS(HalfRetracementStyle));
+            int firstVisBar = chartBars.FromIndex;
+            int lastVisBar = chartBars.ToIndex;
+
+            using (var br = new SharpDX.Direct2D1.SolidColorBrush(rt, hrC4))
+            {
+                for (int i = 0; i < _halfRetraceRenders.Count; i++)
+                {
+                    var hr = _halfRetraceRenders[i];
+                    if (hr.StartBar > lastVisBar && hr.EndBar > lastVisBar) continue;
+                    if (hr.StartBar < firstVisBar && hr.EndBar < firstVisBar) continue;
+
+                    float xLeft, xRight;
+                    try
+                    {
+                        xLeft = cc.GetXByBarIndex(chartBars, hr.StartBar);
+                        xRight = cc.GetXByBarIndex(chartBars, hr.EndBar);
+                    }
+                    catch { continue; }
+
+                    float y = cs.GetYByValue(hr.Price);
+                    rt.DrawLine(new SharpDX.Vector2(xLeft, y), new SharpDX.Vector2(xRight, y), br, HalfRetracementWidth, hrStroke);
+                }
+            }
+        }
+
+        private void RenderDisplacement(SharpDX.Direct2D1.RenderTarget rt, ChartControl cc, ChartScale cs, ChartBars chartBars)
+        {
+            if (!ShowDisplacement || _displacementRenders == null || _displacementRenders.Count == 0) return;
+
+            int firstVisBar = chartBars.FromIndex;
+            int lastVisBar = chartBars.ToIndex;
+
+            var bullC4 = B2C4(BullDisplacementColor, DisplacementMarkerOpacity / 100f);
+            var bearC4 = B2C4(BearDisplacementColor, DisplacementMarkerOpacity / 100f);
+
+            using (var bullBr = new SharpDX.Direct2D1.SolidColorBrush(rt, bullC4))
+            using (var bearBr = new SharpDX.Direct2D1.SolidColorBrush(rt, bearC4))
+            {
+                float halfSize = 4f;
+                for (int i = 0; i < _displacementRenders.Count; i++)
+                {
+                    var d = _displacementRenders[i];
+                    if (d.BarIndex < firstVisBar || d.BarIndex > lastVisBar) continue;
+
+                    float x;
+                    try { x = cc.GetXByBarIndex(chartBars, d.BarIndex); } catch { continue; }
+                    float y = cs.GetYByValue(d.Price);
+
+                    // Draw diamond shape
+                    var brush = d.IsBull ? bullBr : bearBr;
+                    using (var path = new SharpDX.Direct2D1.PathGeometry(rt.Factory))
+                    {
+                        using (var sink = path.Open())
+                        {
+                            sink.BeginFigure(new SharpDX.Vector2(x, y - halfSize), SharpDX.Direct2D1.FigureBegin.Filled);
+                            sink.AddLine(new SharpDX.Vector2(x + halfSize, y));
+                            sink.AddLine(new SharpDX.Vector2(x, y + halfSize));
+                            sink.AddLine(new SharpDX.Vector2(x - halfSize, y));
+                            sink.EndFigure(SharpDX.Direct2D1.FigureEnd.Closed);
+                            sink.Close();
+                        }
+                        rt.FillGeometry(path, brush);
+                    }
+                }
+            }
+        }
+
+        private void RenderOBBorders(SharpDX.Direct2D1.RenderTarget rt, ChartControl cc, ChartScale cs, ChartBars chartBars)
+        {
+            if (_bullOBList == null || _bearOBList == null) return;
+
+            int mx = GetMaxOB();
+            float borderOp = OBBorderOpacity / 100f;
+
+            foreach (var obList in new[] { _bullOBList, _bearOBList })
+            {
+                int count = 0;
+                foreach (var ob in obList)
+                {
+                    if (ob.Disabled || ob.Tag == null) continue;
+                    if (!ShowHistoricZones && ob.Breaker) continue;
+                    if (count >= mx) break;
+                    count++;
+
+                    bool ib = (ob.OBType == "Bull");
+                    int sa = CurrentBar - ob.StartBar;
+                    if (sa < 0 || sa > CurrentBar) continue;
+                    double mp = (ob.Top + ob.Bottom) / 2.0;
+
+                    float yTop = cs.GetYByValue(ob.Top);
+                    float yBot = cs.GetYByValue(ob.Bottom);
+                    float yMid = cs.GetYByValue(mp);
+
+                    if (ob.Breaker && ConvertToBreaker && ob.BreakBar > 0)
+                    {
+                        float xLeft, xBreak, xRight;
+                        try
+                        {
+                            xLeft = cc.GetXByBarIndex(chartBars, ob.StartBar);
+                            xBreak = cc.GetXByBarIndex(chartBars, ob.BreakBar);
+                            xRight = cc.GetXByBarIndex(chartBars, CurrentBar + BoxExtendBars);
+                        }
+                        catch { continue; }
+
+                        // OB segment (solid)
+                        var obC4 = B2C4(ib ? BullOBColor : BearOBColor, borderOp);
+                        using (var br = new SharpDX.Direct2D1.SolidColorBrush(rt, obC4))
+                        {
+                            rt.DrawLine(new SharpDX.Vector2(xLeft, yTop), new SharpDX.Vector2(xBreak, yTop), br, 1, _ssSolid);
+                            rt.DrawLine(new SharpDX.Vector2(xLeft, yBot), new SharpDX.Vector2(xBreak, yBot), br, 1, _ssSolid);
+                            rt.DrawLine(new SharpDX.Vector2(xLeft, yMid), new SharpDX.Vector2(xBreak, yMid), br, 1, _ssDot);
+                        }
+
+                        // Breaker segment (dashed)
+                        var brkC4 = B2C4(ib ? BullBreakerColor : BearBreakerColor, borderOp);
+                        using (var br = new SharpDX.Direct2D1.SolidColorBrush(rt, brkC4))
+                        {
+                            rt.DrawLine(new SharpDX.Vector2(xBreak, yTop), new SharpDX.Vector2(xRight, yTop), br, 1, _ssDash);
+                            rt.DrawLine(new SharpDX.Vector2(xBreak, yBot), new SharpDX.Vector2(xRight, yBot), br, 1, _ssDash);
+                            rt.DrawLine(new SharpDX.Vector2(xBreak, yMid), new SharpDX.Vector2(xRight, yMid), br, 1, _ssDot);
+                        }
+                    }
+                    else
+                    {
+                        float xLeft, xRight;
+                        try
+                        {
+                            xLeft = cc.GetXByBarIndex(chartBars, ob.StartBar);
+                            xRight = cc.GetXByBarIndex(chartBars, CurrentBar + BoxExtendBars);
+                        }
+                        catch { continue; }
+
+                        var lineC4 = B2C4(ib ? BullOBColor : BearOBColor, borderOp);
+                        var lineStroke = ob.Breaker ? _ssDash : _ssSolid;
+                        using (var br = new SharpDX.Direct2D1.SolidColorBrush(rt, lineC4))
+                        {
+                            rt.DrawLine(new SharpDX.Vector2(xLeft, yTop), new SharpDX.Vector2(xRight, yTop), br, 1, lineStroke);
+                            rt.DrawLine(new SharpDX.Vector2(xLeft, yBot), new SharpDX.Vector2(xRight, yBot), br, 1, lineStroke);
+                            rt.DrawLine(new SharpDX.Vector2(xLeft, yMid), new SharpDX.Vector2(xRight, yMid), br, 1, _ssDot);
+                        }
+                    }
+                }
             }
         }
 
@@ -1674,6 +2137,132 @@ Write-Host 'COPIED_MP3'
         private void CalcVolumeProfile(FRVPZone z, Bars bars)
         {
             z.Dirty = false;
+
+            int sb = z.StartBar, eb = z.IsActive ? bars.Count - 1 : z.EndBar;
+            if (sb >= bars.Count || eb < sb) return;
+            int sIdx = Math.Max(0, sb);
+            int eIdx = Math.Min(eb, bars.Count - 1);
+            if (sIdx > eIdx) return;
+
+            // ── Determine if we can do an incremental update ──
+            // Incremental is possible when:
+            //  1. We have existing volume data from a previous calc
+            //  2. The price range hasn't expanded (bins haven't changed)
+            //  3. LastProcessedBarIdx is valid
+            bool canIncremental = false;
+            int incrStartIdx = sIdx;
+
+            if (z.LastProcessedBarIdx > 0 && z.Volumes != null && z.Volumes.Count == FRVPRows
+                && z.IncrBullVol != null && z.IncrBearVol != null
+                && z.IncrBullVol.Length == FRVPRows && z.IncrBearVol.Length == FRVPRows)
+            {
+                // Check if new bars expand the price range
+                double newHigh = z.HighPrice, newLow = z.LowPrice;
+                for (int i = z.LastProcessedBarIdx + 1; i <= eIdx; i++)
+                {
+                    double hi = bars.GetHigh(i), lo = bars.GetLow(i);
+                    if (hi > newHigh) newHigh = hi;
+                    if (lo < newLow) newLow = lo;
+                }
+
+                // If range hasn't expanded, we can do incremental
+                if (newHigh <= z.HighPrice && newLow >= z.LowPrice && z.ProfileInterval > 0)
+                {
+                    canIncremental = true;
+                    incrStartIdx = z.LastProcessedBarIdx + 1;
+                }
+                else
+                {
+                    // Range expanded — update tracked range and fall through to full recalc
+                    z.HighPrice = newHigh;
+                    z.LowPrice = newLow;
+                }
+            }
+
+            if (canIncremental && incrStartIdx <= eIdx)
+            {
+                // ── INCREMENTAL PATH: only process new bars ──
+                for (int i = incrStartIdx; i <= eIdx; i++)
+                {
+                    double lo = bars.GetLow(i), hi = bars.GetHigh(i), vol = bars.GetVolume(i);
+                    double op = bars.GetOpen(i), cl = bars.GetClose(i);
+                    bool isBullish = cl >= op;
+                    int minI = Math.Max(0, Math.Min((int)Math.Floor((lo - z.ProfileLowest) / z.ProfileInterval), FRVPRows - 1));
+                    int maxI = Math.Max(0, Math.Min((int)Math.Ceiling((hi - z.ProfileLowest) / z.ProfileInterval), FRVPRows - 1));
+                    int touched = maxI - minI + 1;
+                    if (touched > 0)
+                    {
+                        double vpl = vol / touched;
+                        bool includeVol = FRVPVolumeType == MSVolumeType.Standard ||
+                                         FRVPVolumeType == MSVolumeType.Both ||
+                                         (FRVPVolumeType == MSVolumeType.Bullish && isBullish) ||
+                                         (FRVPVolumeType == MSVolumeType.Bearish && !isBullish);
+                        if (includeVol)
+                        {
+                            for (int j = minI; j <= maxI; j++)
+                            {
+                                z.Volumes[j] += vpl;
+                                if (isBullish) z.IncrBullVol[j] += vpl;
+                                else z.IncrBearVol[j] += vpl;
+                            }
+                        }
+                    }
+                }
+
+                // Update polarity
+                for (int i = 0; i < FRVPRows; i++)
+                    z.VolumePolarities[i] = z.IncrBullVol[i] >= z.IncrBearVol[i];
+
+                // Recompute POC from accumulated volumes (fast scan)
+                z.MaxVolume = 0; z.PocIndex = 0;
+                for (int i = 0; i < FRVPRows; i++)
+                    if (z.Volumes[i] > z.MaxVolume) { z.MaxVolume = z.Volumes[i]; z.PocIndex = i; }
+
+                // Recompute Value Area
+                z.VaUpIndex = z.PocIndex; z.VaDownIndex = z.PocIndex;
+                double sumVol = 0; for (int i = 0; i < z.Volumes.Count; i++) sumVol += z.Volumes[i];
+                double vaTarget = sumVol * FRVPValueAreaPct / 100.0;
+                double vaSum = z.MaxVolume;
+                while (vaSum < vaTarget)
+                {
+                    double vUp = (z.VaUpIndex < FRVPRows - 1) ? z.Volumes[z.VaUpIndex + 1] : 0;
+                    double vDn = (z.VaDownIndex > 0) ? z.Volumes[z.VaDownIndex - 1] : 0;
+                    if (vUp == 0 && vDn == 0) break;
+                    if (vUp >= vDn) { vaSum += vUp; z.VaUpIndex++; } else { vaSum += vDn; z.VaDownIndex--; }
+                }
+
+                // Recompute AVWAP (must be full — cumulative from anchor)
+                if (FRVPDisplayAVWAP)
+                {
+                    if (z.AvwapPoints == null) z.AvwapPoints = new List<KeyValuePair<int, double>>(256);
+                    else z.AvwapPoints.Clear();
+                    int avwapStart = Math.Max(z.AvwapAnchorBar, sIdx);
+                    double cumVol = 0, cumTV = 0;
+                    for (int i = avwapStart; i < bars.Count; i++)
+                    {
+                        double vol = bars.GetVolume(i);
+                        double src = (bars.GetOpen(i) + bars.GetHigh(i) + bars.GetLow(i) + bars.GetClose(i)) / 4.0;
+                        cumVol += vol; cumTV += src * vol;
+                        if (cumVol > 0) z.AvwapPoints.Add(new KeyValuePair<int, double>(i, cumTV / cumVol));
+                    }
+                }
+
+                // Update dynamic fib endpoints for active zones
+                if (z.IsActive)
+                {
+                    if (z.Direction == 1) { z.StartPrice = z.LowPrice; z.EndPrice = z.HighPrice; }
+                    else                  { z.StartPrice = z.HighPrice; z.EndPrice = z.LowPrice; }
+                }
+
+                // Cluster Levels (full recalc — these are cheap relative to volume profile)
+                if (FRVPDisplayClusters)
+                    CalcClusterLevels(z, bars, sIdx, eIdx);
+
+                z.LastProcessedBarIdx = eIdx;
+                return;
+            }
+
+            // ── FULL RECALC PATH (first calc or range expanded) ──
             z.MaxVolume = 0; z.PocIndex = -1; z.VaUpIndex = -1; z.VaDownIndex = -1;
 
             // Reuse volume list instead of allocating new
@@ -1693,8 +2282,16 @@ Write-Host 'COPIED_MP3'
             else
                 for (int i = 0; i < FRVPRows; i++) z.VolumePolarities[i] = true;
 
-            double[] bullishVolume = new double[FRVPRows];
-            double[] bearishVolume = new double[FRVPRows];
+            // Allocate or reset incremental tracking arrays
+            if (z.IncrBullVol == null || z.IncrBullVol.Length != FRVPRows)
+                z.IncrBullVol = new double[FRVPRows];
+            else
+                Array.Clear(z.IncrBullVol, 0, FRVPRows);
+
+            if (z.IncrBearVol == null || z.IncrBearVol.Length != FRVPRows)
+                z.IncrBearVol = new double[FRVPRows];
+            else
+                Array.Clear(z.IncrBearVol, 0, FRVPRows);
 
             // Reuse AVWAP list
             if (z.AvwapPoints == null) z.AvwapPoints = new List<KeyValuePair<int, double>>(256);
@@ -1702,17 +2299,12 @@ Write-Host 'COPIED_MP3'
 
             z.HighPrice = double.MinValue; z.LowPrice = double.MaxValue;
 
-            int sb = z.StartBar, eb = z.IsActive ? bars.Count - 1 : z.EndBar;
-            int sIdx = -1, eIdx = -1;
-
-            // Start loop at sb instead of 0
-            for (int i = sb; i <= eb && i < bars.Count; i++)
+            for (int i = sIdx; i <= eIdx; i++)
             {
-                if (sIdx == -1) sIdx = i; eIdx = i;
                 z.HighPrice = Math.Max(z.HighPrice, bars.GetHigh(i));
                 z.LowPrice = Math.Min(z.LowPrice, bars.GetLow(i));
             }
-            if (sIdx == -1 || z.HighPrice <= z.LowPrice) return;
+            if (z.HighPrice <= z.LowPrice) return;
 
             if (z.IsActive)
             {
@@ -1744,8 +2336,8 @@ Write-Host 'COPIED_MP3'
                         for (int j = minI; j <= maxI; j++)
                         {
                             z.Volumes[j] += vpl;
-                            if (isBullish) bullishVolume[j] += vpl;
-                            else bearishVolume[j] += vpl;
+                            if (isBullish) z.IncrBullVol[j] += vpl;
+                            else z.IncrBearVol[j] += vpl;
                         }
                     }
                 }
@@ -1753,22 +2345,22 @@ Write-Host 'COPIED_MP3'
 
             // Set polarity for each row
             for (int i = 0; i < FRVPRows; i++)
-                z.VolumePolarities[i] = bullishVolume[i] >= bearishVolume[i];
+                z.VolumePolarities[i] = z.IncrBullVol[i] >= z.IncrBearVol[i];
 
             z.PocIndex = 0;
             for (int i = 0; i < FRVPRows; i++) if (z.Volumes[i] > z.MaxVolume) { z.MaxVolume = z.Volumes[i]; z.PocIndex = i; }
 
             // Value Area
             z.VaUpIndex = z.PocIndex; z.VaDownIndex = z.PocIndex;
-            double sumVol = 0; for (int i = 0; i < z.Volumes.Count; i++) sumVol += z.Volumes[i];
-            double vaTarget = sumVol * FRVPValueAreaPct / 100.0;
-            double vaSum = z.MaxVolume;
-            while (vaSum < vaTarget)
+            double fullSumVol = 0; for (int i = 0; i < z.Volumes.Count; i++) fullSumVol += z.Volumes[i];
+            double fullVaTarget = fullSumVol * FRVPValueAreaPct / 100.0;
+            double fullVaSum = z.MaxVolume;
+            while (fullVaSum < fullVaTarget)
             {
                 double vUp = (z.VaUpIndex < FRVPRows - 1) ? z.Volumes[z.VaUpIndex + 1] : 0;
                 double vDn = (z.VaDownIndex > 0) ? z.Volumes[z.VaDownIndex - 1] : 0;
                 if (vUp == 0 && vDn == 0) break;
-                if (vUp >= vDn) { vaSum += vUp; z.VaUpIndex++; } else { vaSum += vDn; z.VaDownIndex--; }
+                if (vUp >= vDn) { fullVaSum += vUp; z.VaUpIndex++; } else { fullVaSum += vDn; z.VaDownIndex--; }
             }
 
             // AVWAP
@@ -1788,6 +2380,8 @@ Write-Host 'COPIED_MP3'
             // Cluster Levels (K-Means)
             if (FRVPDisplayClusters)
                 CalcClusterLevels(z, bars, sIdx, eIdx);
+
+            z.LastProcessedBarIdx = eIdx;
         }
 
         private void CalcClusterLevels(FRVPZone z, Bars bars, int sIdx, int eIdx)
@@ -1977,7 +2571,7 @@ Write-Host 'COPIED_MP3'
             {
                 bool isHH = (cH >= _prevHigh); _prevSwingType = isHH ? 2 : 1;
                 if (isHH && psb == -1 && ShowHalfRetracement)
-                { _msTagCounter++; double h = (_prevLow + cH) / 2; Draw.Line(this, "RT_H_" + _msTagCounter, false, CurrentBar - _prevLowIndex, h, len, h, _cachedRetraceBrush, GetDS(HalfRetracementStyle), HalfRetracementWidth); }
+                { double h = (_prevLow + cH) / 2; _halfRetraceRenders.Add(new HalfRetraceInfo { StartBar = _prevLowIndex, EndBar = CurrentBar - len, Price = h }); }
 
                 // Strong/Weak evaluation — multi-factor
                 bool isStrong = false;
@@ -1988,12 +2582,9 @@ Write-Host 'COPIED_MP3'
 
                 if (ShowSwingLabels)
                 {
-                    _msTagCounter++;
                     string swingLbl = isHH ? "HH" : "LH";
                     if (ShowStrongWeakLevels) swingLbl += isStrong ? " (S)" : " (W)";
-                    Draw.Text(this, "RT_S_" + _msTagCounter, false, swingLbl, len, cH + TickSize * 3, 0, SwingLabelColor,
-                        _swingFont, System.Windows.TextAlignment.Center,
-                        System.Windows.Media.Brushes.Transparent, System.Windows.Media.Brushes.Transparent, 0);
+                    _swingLabelRenders.Add(new SwingLabelInfo { BarIndex = CurrentBar - len, Price = cH + TickSize * 3, Label = swingLbl, IsHigh = true });
                 }
 
                 // Add strong level ray
@@ -2034,7 +2625,7 @@ Write-Host 'COPIED_MP3'
             {
                 bool isHL = (cL >= _prevLow); _prevSwingType = isHL ? -1 : -2;
                 if (!isHL && psb == 1 && ShowHalfRetracement)
-                { _msTagCounter++; double h = (_prevHigh + cL) / 2; Draw.Line(this, "RT_H_" + _msTagCounter, false, CurrentBar - _prevHighIndex, h, len, h, _cachedRetraceBrush, GetDS(HalfRetracementStyle), HalfRetracementWidth); }
+                { double h = (_prevHigh + cL) / 2; _halfRetraceRenders.Add(new HalfRetraceInfo { StartBar = _prevHighIndex, EndBar = CurrentBar - len, Price = h }); }
 
                 // Strong/Weak evaluation — multi-factor
                 bool isStrong = false;
@@ -2045,12 +2636,9 @@ Write-Host 'COPIED_MP3'
 
                 if (ShowSwingLabels)
                 {
-                    _msTagCounter++;
                     string swingLbl = isHL ? "HL" : "LL";
                     if (ShowStrongWeakLevels) swingLbl += isStrong ? " (S)" : " (W)";
-                    Draw.Text(this, "RT_S_" + _msTagCounter, false, swingLbl, len, cL - TickSize * 3, 0, SwingLabelColor,
-                        _swingFont, System.Windows.TextAlignment.Center,
-                        System.Windows.Media.Brushes.Transparent, System.Windows.Media.Brushes.Transparent, 0);
+                    _swingLabelRenders.Add(new SwingLabelInfo { BarIndex = CurrentBar - len, Price = cL - TickSize * 3, Label = swingLbl, IsHigh = false });
                 }
 
                 // Add strong level ray
@@ -2104,10 +2692,7 @@ Write-Host 'COPIED_MP3'
                     _legOriginHighIndex = _prevHighIndex;
                 }
                 
-                _msTagCounter++; Draw.Line(this, "RT_B_" + _msTagCounter, false, ba, _prevHigh, 0, _prevHigh, _cachedBOSBrush, GetDS(BOSStyle), BOSWidth);
-                _msTagCounter++; Draw.Text(this, "RT_BT_" + _msTagCounter, false, choch ? "CHoCH" : "BOS", ba / 2, _prevHigh + TickSize * 2, 0, _cachedBOSBrush,
-                    _bosFont, System.Windows.TextAlignment.Center,
-                    System.Windows.Media.Brushes.Transparent, System.Windows.Media.Brushes.Transparent, 0);
+                _bosRenders.Add(new BOSRenderInfo { StartBar = _prevHighIndex, EndBar = CurrentBar, Price = _prevHigh, IsCHoCH = choch, IsBull = true });
                 if (choch && EnableFRVP && FRVPTrigger == "CHoCH") CreateFRVPZone(1);
 
                 // Trend state tracking
@@ -2157,10 +2742,7 @@ Write-Host 'COPIED_MP3'
                     _legOriginLowIndex = _prevLowIndex;
                 }
                 
-                _msTagCounter++; Draw.Line(this, "RT_B_" + _msTagCounter, false, ba, _prevLow, 0, _prevLow, _cachedBOSBrush, GetDS(BOSStyle), BOSWidth);
-                _msTagCounter++; Draw.Text(this, "RT_BT_" + _msTagCounter, false, choch ? "CHoCH" : "BOS", ba / 2, _prevLow - TickSize * 2, 0, _cachedBOSBrush,
-                    _bosFont, System.Windows.TextAlignment.Center,
-                    System.Windows.Media.Brushes.Transparent, System.Windows.Media.Brushes.Transparent, 0);
+                _bosRenders.Add(new BOSRenderInfo { StartBar = _prevLowIndex, EndBar = CurrentBar, Price = _prevLow, IsCHoCH = choch, IsBull = false });
                 if (choch && EnableFRVP && FRVPTrigger == "CHoCH") CreateFRVPZone(-1);
 
                 // Trend state tracking
@@ -2373,50 +2955,15 @@ Write-Host 'COPIED_MP3'
 
         private void RenderAllOBs()
         {
+            // OB borders are now rendered entirely via SharpDX in OnRender.
+            // This method only prunes disabled/excess OBs from the lists.
             int mx = GetMaxOB(); int bc = 0, rc = 0;
-            foreach (var ob in _bullOBList) { if (ob.Disabled) continue; if (!ShowHistoricZones && ob.Breaker) { RmOB(ob); continue; } if (bc >= mx) { RmOB(ob); continue; } DrawOB(ob); bc++; }
-            foreach (var ob in _bearOBList) { if (ob.Disabled) continue; if (!ShowHistoricZones && ob.Breaker) { RmOB(ob); continue; } if (rc >= mx) { RmOB(ob); continue; } DrawOB(ob); rc++; }
+            for (int i = _bullOBList.Count - 1; i >= 0; i--) { var ob = _bullOBList[i]; if (ob.Disabled) continue; if (!ShowHistoricZones && ob.Breaker) continue; bc++; }
+            for (int i = _bearOBList.Count - 1; i >= 0; i--) { var ob = _bearOBList[i]; if (ob.Disabled) continue; if (!ShowHistoricZones && ob.Breaker) continue; rc++; }
         }
 
-        private void DrawOB(OBInfo ob)
-        {
-            if (ob.Tag == null) return;
-            bool ib = (ob.OBType == "Bull"); int sa = CurrentBar - ob.StartBar;
-            if (sa < 0 || sa > CurrentBar) return;
-            double mp = (ob.Top + ob.Bottom) / 2.0;
-
-            if (ob.Breaker && ConvertToBreaker && ob.BreakBar > 0)
-            {
-                // Split rendering: OB segment (start -> break) + Breaker segment (break -> extend)
-                int breakBarsAgo = CurrentBar - ob.BreakBar;
-
-                // Segment 1: Original OB color from start to break point
-                var obBrush = MB(ib ? BullOBColor : BearOBColor, OBBorderOpacity);
-                Draw.Line(this, ob.Tag + "_LT", false, sa, ob.Top, breakBarsAgo, ob.Top, obBrush, DashStyleHelper.Solid, 1);
-                Draw.Line(this, ob.Tag + "_LB", false, sa, ob.Bottom, breakBarsAgo, ob.Bottom, obBrush, DashStyleHelper.Solid, 1);
-                Draw.Line(this, ob.Tag + "_LM", false, sa, mp, breakBarsAgo, mp, obBrush, DashStyleHelper.Dot, 1);
-
-                // Segment 2: Breaker color from break point forward
-                var brkBrush = MB(ib ? BullBreakerColor : BearBreakerColor, OBBorderOpacity);
-                Draw.Line(this, ob.Tag + "_BT", false, breakBarsAgo, ob.Top, -BoxExtendBars, ob.Top, brkBrush, DashStyleHelper.Dash, 1);
-                Draw.Line(this, ob.Tag + "_BB", false, breakBarsAgo, ob.Bottom, -BoxExtendBars, ob.Bottom, brkBrush, DashStyleHelper.Dash, 1);
-                Draw.Line(this, ob.Tag + "_BM", false, breakBarsAgo, mp, -BoxExtendBars, mp, brkBrush, DashStyleHelper.Dot, 1);
-            }
-            else
-            {
-                // Standard single-segment rendering
-                int ea = (ob.Breaker && ob.BreakBar > 0) ? CurrentBar - ob.BreakBar : -BoxExtendBars;
-                var b = MB(ib ? BullOBColor : BearOBColor, OBBorderOpacity);
-                DashStyleHelper ds = ob.Breaker ? DashStyleHelper.Dash : DashStyleHelper.Solid;
-                Draw.Line(this, ob.Tag + "_LT", false, sa, ob.Top, ea, ob.Top, b, ds, 1);
-                Draw.Line(this, ob.Tag + "_LB", false, sa, ob.Bottom, ea, ob.Bottom, b, ds, 1);
-                Draw.Line(this, ob.Tag + "_LM", false, sa, mp, ea, mp, b, DashStyleHelper.Dot, 1);
-                // Clean up breaker segments if they existed before
-                foreach (var s in new[] { "_BT", "_BB", "_BM" }) RemoveDrawObject(ob.Tag + s);
-            }
-        }
-
-        private void RmOB(OBInfo ob) { if (ob.Tag == null) return; foreach (var s in new[] { "_LT", "_LB", "_LM", "_BT", "_BB", "_BM" }) RemoveDrawObject(ob.Tag + s); }
+        private void DrawOB(OBInfo ob) { /* no-op: rendered via SharpDX */ }
+        private void RmOB(OBInfo ob) { /* no-op: no Draw objects to remove */ }
         private int GetMaxOB() { switch (ZoneCount) { case "One": return 1; case "Low": return 3; case "Medium": return 5; case "High": return 10; default: return 3; } }
 
         #endregion
@@ -2437,9 +2984,7 @@ Write-Host 'COPIED_MP3'
 
             if (isDisplacement)
             {
-                _msTagCounter++;
-                var brush = isBull ? _cachedBullDispBrush : _cachedBearDispBrush;
-                Draw.Diamond(this, "RT_D_" + _msTagCounter, false, 0, isBull ? Low[0] - TickSize * 4 : High[0] + TickSize * 4, brush);
+                _displacementRenders.Add(new DisplacementInfo { BarIndex = CurrentBar, Price = isBull ? Low[0] - TickSize * 4 : High[0] + TickSize * 4, IsBull = isBull });
             }
         }
 
