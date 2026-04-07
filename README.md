@@ -15,25 +15,12 @@
   </a>
 </p>
 
+---
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/3astbeast/RedTail-Market-Structure/refs/heads/main/Screenshot%202026-03-03%20084922.png" width="800" alt="RedTail Market Structure Screenshot"/>
 </p>
 
----
-
-**IMPORTANT INSTALLATION INSTRUCTIONS**
-
-This indicator uses Windows Voice for alerts instead of Ninja Trader's built in beeps, honks and blips. If you install this .cs file and get an error on compilation, your NT install is missing a required .dll.  See step #7 below:
-
-1. Download the .cs file from the indicator's repository
-2. Copy the .cs to documents\Ninja Trader 8\bin\custom\indicators
-3. Open Ninja Trader (if not already open) 
-4. In control center, go to New --> Ninja Script Editor
-5. Expand the Indicator Tree, find your new indicator, double click to open it
-6. At the top of the Editor window, click the "Compile" button
-7. If you get an error on compilation, do the following: Open Ninja Compiler, right click and choose references. Click add. Browse to this: C:\Windows\Microsoft.NET\assembly\GAC_MSIL\System.Speech\v4.0_4.0.0.0__31bf3856ad364e35\System.Speech.dll
-8. After that .dll is referenced, the indicator will compile successfully.
-   
 ---
 
 ## Overview
@@ -87,6 +74,7 @@ Detects and draws order blocks (supply/demand zones) at key structural points.
 - **Box Extend Bars** — How far forward the OB rectangle extends
 - **Delete Broken Boxes** — Automatically remove invalidated order blocks
 - **Show Historic Zones** — Toggle visibility of already-mitigated zones
+- **Filter OBs by Value Area** — When enabled, only displays order blocks that are outside the current Value Area: bullish OBs must be entirely below VAL, bearish OBs must be entirely above VAH. Highlights mean-reversion zones where price is likely to retrace toward the POC. **Requires RedTail Volume Profile to be on the same chart** — if no Volume Profile is present, the filter is ignored and all OBs display normally.
 - Independent bullish/bearish OB colors with per-side opacity and border opacity
 
 ---
@@ -183,15 +171,40 @@ Detects when price wicks through a key level and reverses — a sign of liquidit
 
 ---
 
+## Companion Indicator
+
+The companion indicator (RedTailMarketStructureCompanion) mirrors Market Structure's strong levels and order block / breaker block zones onto charts running different bar types for the same instrument. Compute your structure on a time-based chart and see the zones on your tick or range trading chart.
+
+**How It Works**
+- Add RedTailMarketStructure to any chart (your "source" chart)
+- Add RedTailMarketStructureCompanion to a different chart for the same instrument (your "trading" chart)
+- The companion discovers the source automatically via a static ConcurrentDictionary registry — no manual linking
+- Set the companion's Source Timeframe Type and Value to match the source chart's bar period
+
+**What It Mirrors**
+- **Strong Levels** — Strong highs and lows with labels and extending lines
+- **Order Blocks** — Bullish and bearish OB zones with fill and border
+- **Breaker Blocks** — Converted OB zones that have been invalidated
+- **Value Area Filter** — If the source has Filter OBs by Value Area enabled, the companion respects the same filter automatically
+
+**Configuration**
+- Independent toggles: Show Strong Levels, Show Order Blocks, Show Breaker Blocks
+- Configurable strong level line width, label font size, and OB border opacity
+- Optional opacity override and status label
+- Connection status label shows whether the companion is connected or searching
+
+---
+
 ## Installation
 
-1. Download the .cs file from the indicator's repository
-2. Copy the .cs to documents\Ninja Trader 8\bin\custom\indicators
-3. Open Ninja Trader (if not already open) 
-4. In control center, go to New --> Ninja Script Editor
-5. Expand the Indicator Tree, find your new indicator, double click to open it
-6. At the top of the Editor window, click the "Compile" button
-7. That's it!
+Both `.cs` files must be installed if you want to use the companion — the companion depends on types defined in the main indicator.
+
+1. Download `RedTailMarketStructure.cs` and optionally `RedTailMarketStructureCompanion.cs`
+2. Copy the file(s) to `Documents\NinjaTrader 8\bin\Custom\Indicators`
+3. Open NinjaTrader (if not already open)
+4. In Control Center, go to **New → NinjaScript Editor**
+5. Click the **Compile** button
+6. Add RedTailMarketStructure to your chart. If using the companion, add it to a separate chart for the same instrument and set the source timeframe to match.
 
 ---
 
