@@ -44,6 +44,7 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
         private static readonly TimeSpan        SnapshotInterval    = TimeSpan.FromMilliseconds(250);
         private string                          _resolvedKey;
         private bool                            _debugPrinted;  // suppress repeated registry dumps once connected
+        private int                             _lastZoneVersion = -1; // tracks source _zoneVersion to skip redundant list copies
 
         // SharpDX brushes / formats / stroke styles
         private SharpDX.Direct2D1.Brush         _dxStrongHigh;
@@ -114,6 +115,7 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
                 _sourceFound    = false;
                 _nextSearchTime = DateTime.MinValue; // fire immediately on first opportunity
                 _debugPrinted   = false;
+                _lastZoneVersion = -1;
 
                 if (Instrument != null)
                 {
@@ -283,8 +285,9 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
                     _nextSearchTime = DateTime.Now + SearchInterval;
                     if (_sourceFound && _source != null)
                     {
-                        _cachedStrong = _source.GetStrongLevels();
-                        _cachedZones  = _source.GetOBZones();
+                        _cachedStrong       = _source.GetStrongLevels();
+                        _cachedZones        = _source.GetOBZones();
+                        _lastZoneVersion    = _source.GetZoneVersion();
                         _lastRenderSnapshot = DateTime.Now;
                     }
                 }
@@ -295,8 +298,15 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
                 // (IsSuspendedWhileInactive=false keeps OnRender firing, but OnBarUpdate may not).
                 if (DateTime.Now - _lastRenderSnapshot >= SnapshotInterval)
                 {
+                    // Only re-copy the zone list when the source actually changed (avoids alloc churn)
+                    int ver = _source.GetZoneVersion();
+                    if (ver != _lastZoneVersion)
+                    {
+                        _cachedZones     = _source.GetOBZones();
+                        _lastZoneVersion = ver;
+                    }
+                    // Strong levels have no version counter — always refresh (lightweight)
                     _cachedStrong       = _source.GetStrongLevels();
-                    _cachedZones        = _source.GetOBZones();
                     _lastRenderSnapshot = DateTime.Now;
                 }
             }
@@ -319,8 +329,6 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
             float currentBarX;
             try { currentBarX = (float)chartControl.GetXByBarIndex(ChartBars, CurrentBar); }
             catch { currentBarX = w; }
-            // Extend a fixed ~20px past the current bar to match "BoxExtendBars" visual feel.
-            float rightEdge = Math.Min(currentBarX + 20f, w);
 
             // ── Order Block / Breaker Block zones ──────────────────────
             if (ShowOrderBlocks || ShowBreakerBlocks)
@@ -334,39 +342,97 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
                     if (z.IsBreaker  && !ShowBreakerBlocks) continue;
                     if (!z.IsBreaker && !ShowOrderBlocks)   continue;
 
-                    // Mirror the source's value-area filter: bull OBs must be fully below VAL,
-                    // bear OBs must be fully above VAH.
+                    // Mirror the source's value-area filter
                     if (vaFilterActive)
                     {
-                        if (z.IsBull  && z.Top    >= vaFilterVAL) continue;
+                        if ( z.IsBull && z.Top    >= vaFilterVAL) continue;
                         if (!z.IsBull && z.Bottom <= vaFilterVAH) continue;
                     }
 
                     float yTop = chartScale.GetYByValue(z.Top);
                     float yBot = chartScale.GetYByValue(z.Bottom);
                     if (yTop > pBot || yBot < pTop) continue;
-
                     yTop = Math.Max(yTop, pTop);
                     yBot = Math.Min(yBot, pBot);
                     float height = yBot - yTop;
                     if (height <= 0) continue;
 
-                    // Pick fill / border brush based on direction + type
-                    SharpDX.Direct2D1.Brush fill, border;
-                    if (z.IsBreaker)
+                    // Map the source OB's formation time to an X pixel on THIS chart.
+                    // GetBarIdxByTime finds the local bar whose open-time is nearest to z.StartTime,
+                    // then GetXByBarIndex converts that to a panel pixel — identical to how the source
+                    // calls GetXByBarIndex(chartBars, ob.StartBar) on its own chart.
+                    float xLeft = 0f;
+                    if (z.StartTime != DateTime.MinValue)
                     {
-                        fill   = z.IsBull ? _dxBearBreakerFill : _dxBullBreakerFill;
-                        border = z.IsBull ? _dxBearOBBorder    : _dxBullOBBorder;
+                        try
+                        {
+                            int localBar = ChartBars.GetBarIdxByTime(chartControl, z.StartTime);
+                            if (localBar >= 0)
+                                xLeft = (float)chartControl.GetXByBarIndex(ChartBars, localBar);
+                        }
+                        catch { }
+                    }
+
+                    // Right edge matches source: currentBar + BoxExtendBars mapped to this chart's pixels
+                    float xRight = currentBarX + 20f; // 20px ≈ one bar width, mirrors BoxExtendBars visual feel
+
+                    if (z.IsBreaker && z.BreakTime != DateTime.MinValue)
+                    {
+                        // Split rendering — OB segment (start→break) in OB colours,
+                        // breaker segment (break→right) in breaker colours.
+                        // Mirrors RenderOBFills / RenderOBBorders split logic in the source.
+                        float xBreak = xLeft; // fallback: collapse OB segment if time lookup fails
+                        try
+                        {
+                            int localBreakBar = ChartBars.GetBarIdxByTime(chartControl, z.BreakTime);
+                            if (localBreakBar >= 0)
+                                xBreak = (float)chartControl.GetXByBarIndex(ChartBars, localBreakBar);
+                        }
+                        catch { }
+
+                        // OB segment fill + border (start → break)
+                        if (xBreak > xLeft)
+                        {
+                            var obFill   = z.IsBull ? _dxBullOBFill   : _dxBearOBFill;
+                            var obBorder = z.IsBull ? _dxBullOBBorder : _dxBearOBBorder;
+                            var obRect   = new SharpDX.RectangleF(xLeft, yTop, xBreak - xLeft, height);
+                            RenderTarget.FillRectangle(obRect, obFill);
+                            RenderTarget.DrawRectangle(obRect, obBorder, 1f);
+                        }
+
+                        // Breaker segment fill + border (break → right)
+                        if (xRight > xBreak)
+                        {
+                            var brkFill   = z.IsBull ? _dxBullBreakerFill : _dxBearBreakerFill;
+                            var brkBorder = z.IsBull ? _dxBearOBBorder    : _dxBullOBBorder;
+                            var brkRect   = new SharpDX.RectangleF(xBreak, yTop, xRight - xBreak, height);
+                            RenderTarget.FillRectangle(brkRect, brkFill);
+                            RenderTarget.DrawRectangle(brkRect, brkBorder, 1f);
+                        }
                     }
                     else
                     {
-                        fill   = z.IsBull ? _dxBullOBFill   : _dxBearOBFill;
-                        border = z.IsBull ? _dxBullOBBorder : _dxBearOBBorder;
-                    }
+                        // Standard single-fill zone (active OB or non-split breaker)
+                        SharpDX.Direct2D1.Brush fill, border;
+                        if (z.IsBreaker)
+                        {
+                            fill   = z.IsBull ? _dxBullBreakerFill : _dxBearBreakerFill;
+                            border = z.IsBull ? _dxBearOBBorder    : _dxBullOBBorder;
+                        }
+                        else
+                        {
+                            fill   = z.IsBull ? _dxBullOBFill   : _dxBearOBFill;
+                            border = z.IsBull ? _dxBullOBBorder : _dxBearOBBorder;
+                        }
 
-                    var rect = new SharpDX.RectangleF(0, yTop, rightEdge, height);
-                    RenderTarget.FillRectangle(rect, fill);
-                    RenderTarget.DrawRectangle(rect, border, 1f);
+                        float rectW = xRight - xLeft;
+                        if (rectW > 0)
+                        {
+                            var rect = new SharpDX.RectangleF(xLeft, yTop, rectW, height);
+                            RenderTarget.FillRectangle(rect, fill);
+                            RenderTarget.DrawRectangle(rect, border, 1f);
+                        }
+                    }
                 }
             }
 
@@ -618,3 +684,60 @@ namespace NinjaTrader.NinjaScript.Indicators.RedTail
         #endregion
     }
 }
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private RedTail.RedTailMarketStructureCompanion[] cacheRedTailMarketStructureCompanion;
+		public RedTail.RedTailMarketStructureCompanion RedTailMarketStructureCompanion(BarsPeriodType sourceBarsPeriodType, int sourceBarsPeriodValue, bool showStrongLevels, bool showMitigatedLevels, bool showOrderBlocks, bool showBreakerBlocks, bool showMitigatedZones, bool showStatusLabel)
+		{
+			return RedTailMarketStructureCompanion(Input, sourceBarsPeriodType, sourceBarsPeriodValue, showStrongLevels, showMitigatedLevels, showOrderBlocks, showBreakerBlocks, showMitigatedZones, showStatusLabel);
+		}
+
+		public RedTail.RedTailMarketStructureCompanion RedTailMarketStructureCompanion(ISeries<double> input, BarsPeriodType sourceBarsPeriodType, int sourceBarsPeriodValue, bool showStrongLevels, bool showMitigatedLevels, bool showOrderBlocks, bool showBreakerBlocks, bool showMitigatedZones, bool showStatusLabel)
+		{
+			if (cacheRedTailMarketStructureCompanion != null)
+				for (int idx = 0; idx < cacheRedTailMarketStructureCompanion.Length; idx++)
+					if (cacheRedTailMarketStructureCompanion[idx] != null && cacheRedTailMarketStructureCompanion[idx].SourceBarsPeriodType == sourceBarsPeriodType && cacheRedTailMarketStructureCompanion[idx].SourceBarsPeriodValue == sourceBarsPeriodValue && cacheRedTailMarketStructureCompanion[idx].ShowStrongLevels == showStrongLevels && cacheRedTailMarketStructureCompanion[idx].ShowMitigatedLevels == showMitigatedLevels && cacheRedTailMarketStructureCompanion[idx].ShowOrderBlocks == showOrderBlocks && cacheRedTailMarketStructureCompanion[idx].ShowBreakerBlocks == showBreakerBlocks && cacheRedTailMarketStructureCompanion[idx].ShowMitigatedZones == showMitigatedZones && cacheRedTailMarketStructureCompanion[idx].ShowStatusLabel == showStatusLabel && cacheRedTailMarketStructureCompanion[idx].EqualsInput(input))
+						return cacheRedTailMarketStructureCompanion[idx];
+			return CacheIndicator<RedTail.RedTailMarketStructureCompanion>(new RedTail.RedTailMarketStructureCompanion(){ SourceBarsPeriodType = sourceBarsPeriodType, SourceBarsPeriodValue = sourceBarsPeriodValue, ShowStrongLevels = showStrongLevels, ShowMitigatedLevels = showMitigatedLevels, ShowOrderBlocks = showOrderBlocks, ShowBreakerBlocks = showBreakerBlocks, ShowMitigatedZones = showMitigatedZones, ShowStatusLabel = showStatusLabel }, input, ref cacheRedTailMarketStructureCompanion);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.RedTail.RedTailMarketStructureCompanion RedTailMarketStructureCompanion(BarsPeriodType sourceBarsPeriodType, int sourceBarsPeriodValue, bool showStrongLevels, bool showMitigatedLevels, bool showOrderBlocks, bool showBreakerBlocks, bool showMitigatedZones, bool showStatusLabel)
+		{
+			return indicator.RedTailMarketStructureCompanion(Input, sourceBarsPeriodType, sourceBarsPeriodValue, showStrongLevels, showMitigatedLevels, showOrderBlocks, showBreakerBlocks, showMitigatedZones, showStatusLabel);
+		}
+
+		public Indicators.RedTail.RedTailMarketStructureCompanion RedTailMarketStructureCompanion(ISeries<double> input , BarsPeriodType sourceBarsPeriodType, int sourceBarsPeriodValue, bool showStrongLevels, bool showMitigatedLevels, bool showOrderBlocks, bool showBreakerBlocks, bool showMitigatedZones, bool showStatusLabel)
+		{
+			return indicator.RedTailMarketStructureCompanion(input, sourceBarsPeriodType, sourceBarsPeriodValue, showStrongLevels, showMitigatedLevels, showOrderBlocks, showBreakerBlocks, showMitigatedZones, showStatusLabel);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.RedTail.RedTailMarketStructureCompanion RedTailMarketStructureCompanion(BarsPeriodType sourceBarsPeriodType, int sourceBarsPeriodValue, bool showStrongLevels, bool showMitigatedLevels, bool showOrderBlocks, bool showBreakerBlocks, bool showMitigatedZones, bool showStatusLabel)
+		{
+			return indicator.RedTailMarketStructureCompanion(Input, sourceBarsPeriodType, sourceBarsPeriodValue, showStrongLevels, showMitigatedLevels, showOrderBlocks, showBreakerBlocks, showMitigatedZones, showStatusLabel);
+		}
+
+		public Indicators.RedTail.RedTailMarketStructureCompanion RedTailMarketStructureCompanion(ISeries<double> input , BarsPeriodType sourceBarsPeriodType, int sourceBarsPeriodValue, bool showStrongLevels, bool showMitigatedLevels, bool showOrderBlocks, bool showBreakerBlocks, bool showMitigatedZones, bool showStatusLabel)
+		{
+			return indicator.RedTailMarketStructureCompanion(input, sourceBarsPeriodType, sourceBarsPeriodValue, showStrongLevels, showMitigatedLevels, showOrderBlocks, showBreakerBlocks, showMitigatedZones, showStatusLabel);
+		}
+	}
+}
+
+#endregion
